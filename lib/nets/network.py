@@ -12,6 +12,11 @@ import tensorflow.contrib.slim as slim
 from tensorflow.contrib.slim import losses
 from tensorflow.contrib.slim import arg_scope
 
+import PIL.Image as Image
+import PIL.ImageColor as ImageColor
+import PIL.ImageDraw as ImageDraw
+import PIL.ImageFont as ImageFont
+
 import numpy as np
 
 from layer_utils.snippets import generate_anchors_pre, generate_anchors_pre_tf
@@ -36,7 +41,10 @@ class Network(object):
     self._train_summaries = []
     self._event_summaries = {}
     self._variables_to_fix = {}
+    self.rpn_im = None
 
+  def _add_rpn_image(self):
+    return tf.summary.image('RPN_Box',self.rpn_im)
   def _add_gt_image(self):
     # add back mean
     image = self._image + cfg.PIXEL_MEANS
@@ -152,7 +160,7 @@ class Network(object):
       # Won't be back-propagated to rois anyway, but to save time
       bboxes = tf.stop_gradient(tf.concat([y1, x1, y2, x2], axis=1))
       pre_pool_size = cfg.POOLING_SIZE * 2
-      crops = tf.image.crop_and_resize(bottom, bboxes, tf.to_int32(batch_ids), [pre_pool_size, pre_pool_size], name="crops")
+      crops = tf.image.crop_and_resize(bottom, bboxes, tf.to_int32(batch_ids), [pre_pool_size, pre_pool_size], method='bilinear', name="crops")
 
     return slim.max_pool2d(crops, [2, 2], padding='SAME')
 
@@ -184,10 +192,10 @@ class Network(object):
 
   def _proposal_target_layer(self, rois, roi_scores, name):
     with tf.variable_scope(name) as scope:
-      rois, roi_scores, labels, bbox_targets, bbox_inside_weights, bbox_outside_weights = tf.py_func(
+      rois, roi_scores, labels, bbox_targets, bbox_inside_weights, bbox_outside_weights, choose_box = tf.py_func(
         proposal_target_layer,
         [rois, roi_scores, self._gt_boxes, self._num_classes],
-        [tf.float32, tf.float32, tf.float32, tf.float32, tf.float32, tf.float32],
+        [tf.float32, tf.float32, tf.float32, tf.float32, tf.float32, tf.float32 ,tf.int64],
         name="proposal_target")
 
       rois.set_shape([cfg.TRAIN.BATCH_SIZE, 5])
@@ -205,7 +213,7 @@ class Network(object):
 
       self._score_summaries.update(self._proposal_targets)
 
-      return rois, roi_scores
+      return rois, choose_box ,roi_scores
 
   def _anchor_component(self):
     with tf.variable_scope('ANCHOR_' + self._tag) as scope:
@@ -229,6 +237,40 @@ class Network(object):
       anchor_length.set_shape([])
       self._anchors = anchors
       self._anchor_length = anchor_length
+
+  def _cut_image(self,image,rois, b, choose_box):
+      image = image.copy()
+      num_boxes = rois.shape[0]
+      print(choose_box)
+      boxes_new = rois[:,1:].copy()
+      boxes_new = boxes_new / b
+
+      print(self._im_info[2])
+      disp_image = Image.fromarray(np.uint8(image[0]))
+
+      for i in range(num_boxes): # TODO:add rectangles to tensorboard...
+        if i < choose_box :
+          disp_image = self._draw_single_box(disp_image, 
+                                    boxes_new[i, 0],
+                                    boxes_new[i, 1],
+                                    boxes_new[i, 2],
+                                    boxes_new[i, 3],
+                                    color='red'
+                                    )
+        else:
+          disp_image = self._draw_single_box(disp_image, 
+                                    boxes_new[i, 0],
+                                    boxes_new[i, 1],
+                                    boxes_new[i, 2],
+                                    boxes_new[i, 3])          
+      image[0, :] = np.array(disp_image)
+      return image
+  def _draw_single_box(self, image, xmin, ymin, xmax, ymax, color='black', thickness=4):
+    draw = ImageDraw.Draw(image)
+    (left, right, top, bottom) = (xmin, xmax, ymin, ymax)
+    draw.line([(left, top), (left, bottom), (right, bottom),
+              (right, top), (left, top)], width=thickness, fill=color)
+    return image
 
   def _build_network(self, is_training=True):
     # select initializers
@@ -312,13 +354,21 @@ class Network(object):
       self._losses['rpn_cross_entropy'] = rpn_cross_entropy
       self._losses['rpn_loss_box'] = rpn_loss_box
 
-      loss = cross_entropy + loss_box + rpn_cross_entropy + rpn_loss_box
+      loss = 0.1 * cross_entropy + loss_box + 0.5 * (0.5 * rpn_cross_entropy + rpn_loss_box) #TODO:loss
+      # 去掉第二步的损失
+      # loss = rpn_cross_entropy + rpn_loss_box
       regularization_loss = tf.add_n(tf.losses.get_regularization_losses(), 'regu')
       self._losses['total_loss'] = loss + regularization_loss
 
       self._event_summaries.update(self._losses)
 
     return loss
+
+  def _crop_tensor(self,rois):
+    n = int(cfg.TRAIN.BATCH_SIZE*cfg.TRAIN.FG_FRACTION)
+    print(n,type(n))
+    rpn_roi_bbox = rois[:n].copy()
+    return rpn_roi_bbox
 
   def _region_proposal(self, net_conv, is_training, initializer):
     rpn = slim.conv2d(net_conv, cfg.RPN_CHANNELS, [3, 3], trainable=is_training, weights_initializer=initializer,
@@ -340,7 +390,20 @@ class Network(object):
       rpn_labels = self._anchor_target_layer(rpn_cls_score, "anchor")
       # Try to have a deterministic order for the computing graph, for reproducibility
       with tf.control_dependencies([rpn_labels]):
-        rois, _ = self._proposal_target_layer(rois, roi_scores, "rpn_rois")
+        rois, choose_box, _ = self._proposal_target_layer(rois, roi_scores, "rpn_rois")
+      # tensorboard to show rpn box
+      # print(rois.shape,type(rois))
+      
+      rpn_roi_bbox = tf.py_func(self._crop_tensor,[rois],tf.float32,name="crop_tensor0")
+      if self._gt_image is None:
+        self._add_gt_image()
+      a = self._gt_image
+      b = self._im_info[2]
+      self.rpn_im = tf.py_func(self._cut_image, 
+                      [a , rpn_roi_bbox,b ,choose_box],
+                      tf.float32, name="rpn_boxes1")
+      
+      
     else:
       if cfg.TEST.MODE == 'nms':
         rois, _ = self._proposal_layer(rpn_cls_prob, rpn_bbox_pred, "rois")
@@ -413,12 +476,18 @@ class Network(object):
       biases_regularizer = tf.no_regularizer
 
     # list as many types of layers as possible, even if they are not used now
-    with arg_scope([slim.conv2d, slim.conv2d_in_plane, \
+    with arg_scope([slim.conv2d, slim.conv2d_in_plane, 
                     slim.conv2d_transpose, slim.separable_conv2d, slim.fully_connected], 
                     weights_regularizer=weights_regularizer,
                     biases_regularizer=biases_regularizer, 
                     biases_initializer=tf.constant_initializer(0.0)): 
       rois, cls_prob, bbox_pred = self._build_network(training)
+
+    # TODO:tensorboard 增加fast rcnn显示
+    # boxes = rois[:, 1:5].copy() / im_scales[0]
+    # scores = np.reshape(cls_prob.copy(), [scores.shape[0], -1])
+    # bbox_pred = np.reshape(bbox_pred.copy(), [bbox_pred.shape[0], -1])
+
 
     layers_to_output = {'rois': rois}
 
@@ -437,6 +506,7 @@ class Network(object):
       val_summaries = []
       with tf.device("/cpu:0"):
         val_summaries.append(self._add_gt_image_summary())
+        val_summaries.append(self._add_rpn_image())
         for key, var in self._event_summaries.items():
           val_summaries.append(tf.summary.scalar(key, var))
         for key, var in self._score_summaries.items():

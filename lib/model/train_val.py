@@ -133,7 +133,7 @@ class SolverWrapper(object):
       if cfg.TRAIN.DOUBLE_BIAS:
         final_gvs = []
         with tf.variable_scope('Gradient_Mult') as scope:
-          for grad, var in gvs:
+          for grad, var in gvs: 
             scale = 1.
             if cfg.TRAIN.DOUBLE_BIAS and '/biases:' in var.name:
               scale *= 2.
@@ -143,7 +143,7 @@ class SolverWrapper(object):
         train_op = self.optimizer.apply_gradients(final_gvs)
       else:
         train_op = self.optimizer.apply_gradients(gvs)
-
+      # train_op = self.optimizer.apply_gradients(gvs)
       # We will handle the snapshots ourselves
       self.saver = tf.train.Saver(max_to_keep=100000)
       # Write the train and validation information to tensorboard

@@ -42,7 +42,7 @@ def _get_image_blob(im):
   processed_ims = []
   im_scale_factors = []
 
-  for target_size in cfg.TEST.SCALES:
+  for target_size in cfg.TEST.SCALES: # (600,)
     im_scale = float(target_size) / float(im_size_min)
     # Prevent the biggest axis from being more than MAX_SIZE
     if np.round(im_scale * im_size_max) > cfg.TEST.MAX_SIZE:
@@ -84,7 +84,7 @@ def _rescale_boxes(boxes, inds, scales):
   return boxes
 
 def im_detect(sess, net, im):
-  blobs, im_scales = _get_blobs(im)
+  blobs, im_scales = _get_blobs(im) # im_scales is the scale transfer ratio of the image
   assert len(im_scales) == 1, "Only single-image batch implemented"
 
   im_blob = blobs['data']
@@ -92,7 +92,7 @@ def im_detect(sess, net, im):
 
   _, scores, bbox_pred, rois = net.test_image(sess, blobs['data'], blobs['im_info'])
   
-  boxes = rois[:, 1:5] / im_scales[0]
+  boxes = rois[:, 1:5] / im_scales[0] # boxes transferred to scales in normal size image
   scores = np.reshape(scores, [scores.shape[0], -1])
   bbox_pred = np.reshape(bbox_pred, [bbox_pred.shape[0], -1])
   if cfg.TEST.BBOX_REG:
@@ -136,6 +136,7 @@ def apply_nms(all_boxes, thresh):
   return nms_boxes
 
 def test_net(sess, net, imdb, weights_filename, max_per_image=100, thresh=0.):
+  import copy
   np.random.seed(cfg.RNG_SEED)
   """Test a Fast R-CNN network on an image database."""
   num_images = len(imdb.image_index)
@@ -148,16 +149,54 @@ def test_net(sess, net, imdb, weights_filename, max_per_image=100, thresh=0.):
   output_dir = get_output_dir(imdb, weights_filename)
   # timers
   _t = {'im_detect' : Timer(), 'misc' : Timer()}
-
   for i in range(num_images):
+    num_empty = 0
     im = cv2.imread(imdb.image_path_at(i))
-
+    im_temp = copy.deepcopy(im)
     _t['im_detect'].tic()
     scores, boxes = im_detect(sess, net, im)
     _t['im_detect'].toc()
-
     _t['misc'].tic()
+    inds_new = np.argmax(scores, axis=1) # get the highest score cls index of each box
+    # print(scores.shape) # (300, 21)
+    scores_new = np.max(scores,axis=1) # get the highest scores of each box
+    # print(scores_new)
+    scores_new_new = [] # store the scores of the highest boxes
+    for j in range(len(inds_new)):
+      if scores_new[j] < 0.7 or inds_new[j] == 0:
+        inds_new[j] = -1
+      else:
+        scores_new_new.append(scores_new[j])
 
+    scores_new_new = np.expand_dims(scores_new_new,1)
+    # print(np.shape(scores_new)) # (300,)
+    # print(boxes.shape) # (300, 84)
+    all_boxes_temp = []
+    for j in range(len(inds_new)):
+      if inds_new[j] != -1:
+        if all_boxes_temp == []:
+          all_boxes_temp = copy.deepcopy(boxes[j,inds_new[j]*4:(inds_new[j]+1)*4])
+        else:
+          all_boxes_temp = np.vstack((all_boxes_temp, boxes[j, inds_new[j]*4:(inds_new[j]+1)*4]))
+    all_boxes_temp = np.array(all_boxes_temp)
+    # print(all_boxes_temp)
+    try:
+      all_boxes_temp = np.hstack((scores_new_new, all_boxes_temp))
+      num_empty += 1
+      # print(num_empty)
+    except:
+      pass
+    # print(all_boxes_temp.shape) # (300, 5)
+    try:
+      keep_new = nms(all_boxes_temp, 0.5)
+      all_boxes_temp = all_boxes_temp[keep_new, :]
+    except:
+      all_boxes_temp = []
+      pass
+    for k in range(len(all_boxes_temp)):
+      cv2.rectangle(im_temp, (all_boxes_temp[k][1], all_boxes_temp[k][2]), (all_boxes_temp[k][3], all_boxes_temp[k][4]), (0, 255, 0), 2)
+      cv2.putText(im_temp, str(all_boxes_temp[k][0]), (all_boxes_temp[k][1], all_boxes_temp[k][2]),cv2.FONT_HERSHEY_COMPLEX,0.5,(0,255,0),1)
+    cv2.imwrite('/home/qzs/Junyu_Liu/tf-faster-rcnn/test_imgs/' + imdb.image_path_at(i)[-10:], im_temp)
     # skip j = 0, because it's the background class
     for j in range(1, imdb.num_classes):
       inds = np.where(scores[:, j] > thresh)[0]
@@ -165,10 +204,10 @@ def test_net(sess, net, imdb, weights_filename, max_per_image=100, thresh=0.):
       cls_boxes = boxes[inds, j*4:(j+1)*4]
       cls_dets = np.hstack((cls_boxes, cls_scores[:, np.newaxis])) \
         .astype(np.float32, copy=False)
+      # print(cls_dets.shape) # (300, 5)
       keep = nms(cls_dets, cfg.TEST.NMS)
       cls_dets = cls_dets[keep, :]
       all_boxes[j][i] = cls_dets
-
     # Limit to max_per_image detections *over all classes*
     if max_per_image > 0:
       image_scores = np.hstack([all_boxes[j][i][:, -1]
